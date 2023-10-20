@@ -1,140 +1,145 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-
-import time
-import selenium
-from selenium import webdriver
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.wait import WebDriverWait
-from selenium.webdriver.support import expected_conditions as ec
-from selenium.webdriver.common.by import By
-from selenium.webdriver.chrome.service import Service
-from selenium.common.exceptions import TimeoutException
-
-from NAS_Libraries.robotlogger import RobotLogger
-from NAS_Libraries.robotkeyword import keyword
-from HDP_Libraries.locators import Locators as Loc
+# pylint: disable=
+from typing import TYPE_CHECKING
+from qnaplib.hero.main import HEROClient
+from qnaplib.ts.main import TSClient
+from baselib.linuxclient.main import LinuxClient
+from baselib.robotlogger import RobotLogger
+from baselib.robotkeyword import keyword
+from baselib.mount import Mount
+import qnaplib.errinj.nas_utils as NAS_UTILS
 
 LOGGER = RobotLogger(__name__)
 
+if TYPE_CHECKING:
+    from qnaplib.errinj import ErrorInjection
 
-class HDP:
-    def __init__(self):
-        self.hdp_driver = None
-        self.check_timeout = 120
-        self.hdp_mouse_pointer = None
+
+class NAS:
+
+    def __init__(self, errclient: "ErrorInjection",
+                 ip_addr, username, password):
+        # NAS product tag (auto detect)
+        self.product = None
+
+        # Define product and load corresponding client
+        if ip_addr:
+            self.product = self.define_product(ip_addr, username, password)
+            if self.product == 'HERO':
+                self.instance = HEROClient()
+            elif self.product == 'TS':
+                self.instance = TSClient()
+            self.instance.connect(ip_addr, username, password)
+
+        self.client = errclient
+        self.load_utils()
+        self.load_keywords()
 
     @property
-    def _get_selenium_version(self):
-        return selenium.__version__
+    def attr(self):
+        return self.instance
 
-    def _load_mouse_pointer(self):
+    @property
+    def cli(self):
+        return self.instance.cli
+
+    @property
+    def qcli(self):
+        return self.instance.qcli
+
+    @property
+    def sftp(self):
+        return self.instance.sftp
+
+    @property
+    def qpkg(self):
+        return self.instance.qpkg
+
+    @property
+    def fltinj(self):
+        return self.instance.fltinj
+
+    @property
+    def lux(self):
+        return self.client.lux
+
+    def define_product(self, ip_addr, username, password):
+        client = LinuxClient(ip_addr, username, password)
+        is_hero = client.run(
+            '[ -f "/etc/QTS_ZFS" ] && echo "TRUE" || echo "FALSE"')
+        product = 'HERO' if is_hero == 'TRUE' else 'TS'
+        client.close()
+
+        return product
+
+    def load_utils(self):
+        self.setup = NAS_UTILS.Setup(self)
+        self.utils = NAS_UTILS.Utils(self)
+        self.fio = NAS_UTILS.FIO(self)
+        self.zfs = NAS_UTILS.ZFS(self)
+
+    def load_keywords(self):
+        self.client.add_sub_library_components(self, 'nas', [
+            'setup', 'utils', 'fio', 'zfs'],
+            manual_add_level=True)
+
+    @keyword('NAS: CLI run')
+    def run(self, cmd, run_async=False):
+        '''
+        Run CLI command on NAS
+        - run_async == TRUE, the scripts won't wait for output and skip block
+        '''
+        if run_async:
+            self.cli.run_async(cmd)
+            return True
+        return self.cli.run(cmd)
+
+    @keyword('NAS: Mount server')
+    def mount(self, server_ip=None, server_path=None, local_path=None,
+              username=None, password=None, version='1.0'):
+        '''
+        Mount server on NAS
+        - Use NFS mount by default
+        - If username/password are provided, use CIFS mount
+        - if server_ip not provide, Linux can still mount folder locally
+        Arguments:
+        | server_ip=<remote server IP>    | server_path=<remote server path>
+        | local_path=<local folder path>          default=/mnt/evt_mount
+        | username=<CIFS login username>          must provide for CIFS mount
+        | password=<CIFS login password>          must provide for CIFS mount
+        | version=<CIFS version>                  default=1.0
+        '''
+        return Mount(self).lux_mount(
+            server_ip=server_ip, server_path=server_path,
+            local_path=local_path, username=username,
+            password=password, version=version)
+
+    @keyword('NAS: Umount server')
+    def umount(self, local_path):
+        '''
+        Umount remote server on NAS
+
+        Arguments:
+        | local_path=<local folder path>
+        '''
+        return Mount(self).lux_umount(local_path=local_path)
+
+    @keyword('NAS: Copy files from NAS to Linux')
+    def copy_files_from_nas_to_lux(self, nas_path, lux_path='/tmp/'):
         """
-        Lib to load mouse pointer with launch of HDP in browser
+        Lib to copy files from NAS to VM
+        :param nas_path: path of the files present in NAS
+        :param lux_path: Path of the Linux where files shall be copied
+        :return: Filepath of the Linux
         """
-        LOGGER.info('|___Load mouse pointer___|')
+        LOGGER.info('|___Copying files from NAS___|')
 
-        self.hdp_mouse_pointer = ActionChains(self.hdp_driver)
+        self.lux.cli.run(f'mkdir -p {lux_path}')
+        filename = nas_path.split('/')[-1]
+        filepath = f'{lux_path}/{filename}'
+        self.sftp.copy_file_between_client(
+            self, self.lux, nas_path, filepath)
 
-        LOGGER.info('Loaded mouse pointer\n')
-        return True
-
-    @keyword('HDP: Launch browser')
-    def launch_browser(self, url, chromedriver_path):
-        """
-        Lib to open URL in the browser and load driver and mouse pointers
-
-        Arguments
-        | url: URL to be opened
-        | chromedriver_path: Executable path of chromedriver
-        """
-        LOGGER.info('|___Launch Browser___|')
-
-        if self._get_selenium_version < '4.0.0':
-            self.hdp_driver = webdriver.Chrome(
-                executable_path=chromedriver_path)
-        else:
-            service = Service(executable_path=chromedriver_path)
-            self.hdp_driver = webdriver.Chrome(service=service)
-        self.hdp_driver.implicitly_wait(10)
-        self.hdp_driver.maximize_window()
-        self.hdp_driver.get(url)
-        self._load_mouse_pointer()
-        navigation_start = self.hdp_driver.execute_script(
-            "return window.performance.timing.navigationStart")
-        response_start = self.hdp_driver.execute_script(
-            "return window.performance.timing.responseStart")
-        dom_complete = self.hdp_driver.execute_script(
-            "return window.performance.timing.domComplete")
-
-        backend_performance = response_start - navigation_start
-        frontend_performance = dom_complete - response_start
-
-        LOGGER.debug(f"Back end: {backend_performance}")
-        LOGGER.debug(f"Front end: {frontend_performance}")
-
-        LOGGER.info('Launched browser\n')
-        return self.hdp_driver, self.hdp_mouse_pointer
-
-    @keyword('HDP: Validate current page title')
-    def validate_current_page_title(self, driver, exp_title):
-        """
-        Lib to validate current web page title
-
-        Arguments
-        | driver: Web driver of HDP
-        | exp_title: expected title to validate with current web page title
-        """
-        LOGGER.info('|___Validate current page title___|')
-
-        webpage_title = driver.title
-        if webpage_title not in exp_title:
-            raise ValueError(f"Expected Title: {exp_title}"
-                             f"Recieved Title: {webpage_title}")
-
-        LOGGER.info("Current page title validated\n")
-        return True
-
-    @keyword('HDP: Validate loading page')
-    def validate_loading_page(self, driver, timeout=None):
-        """
-        Lib to validate loading screen observed after any operations
-
-        Arguments
-        | driver: Web driver of HDP
-        | timeout: time (in sec) to validate if screen is still loading
-        """
-        LOGGER.info('|___Validate loading page___|')
-
-        timeout = timeout or self.check_timeout
-        start_time = time.time()
-
-        while True:
-            if time.time() - start_time > int(timeout):
-                raise ValueError("Screen is still loading after waiting")
-
-            try:
-                WebDriverWait(driver, 3).until(ec.presence_of_element_located((
-                    By.CSS_SELECTOR, Loc.HDP_LOADING_PAGE_CSS)))
-            except TimeoutException:
-                break
-
-            LOGGER.debug("Screen is still loading, retrying..")
-
-        LOGGER.info("Screen loading is completed\n")
-        return True
-
-    @keyword('HDP: Close browser')
-    def close_browser(self, driver):
-        """
-        Lib to close all tabs in the browser
-
-        Arguments
-        | driver: Web driver of HDP
-        """
-        LOGGER.info('|___Close browser___|')
-
-        driver.quit()
-
-        LOGGER.info('Successfully closed browser\n')
-        return True
+        LOGGER.info(f'File is copied to VM [{filepath}]\n')
+        return filepath
